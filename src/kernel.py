@@ -2,7 +2,6 @@ import torch
 from typing import Callable, List
 from tqdm import tqdm
 
-
 class STLKernel:
     """STL kernel for measuring formula similarity via robustness semantics."""
     
