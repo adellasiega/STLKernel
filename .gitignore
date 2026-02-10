@@ -1,9 +1,22 @@
-venv/
-pip_tmp/
+# Byte-compiled files
 __pycache__/
-*.pyc
-# Build and packaging
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+
+# Distribution
 *.egg-info/
 build/
 dist/
-*.py[cod]
+
+# Temporary files
+pip_tmp/
+
+# Jupyter
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
