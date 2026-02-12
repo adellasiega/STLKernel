@@ -1,36 +1,43 @@
+import os 
 import torch
-from typing import Callable, List
+import shutil
 from tqdm import tqdm
+from typing import Optional, List
 
 class STLKernel:
-    """STL kernel for measuring formula similarity via robustness semantics."""
+    """
+    STL kernel for measuring formula similarity via robustness semantics.
+    """
     
     def __init__(
         self,
-        trajectory_sampler: Callable,
-        n_trajectories: int = 1000, 
+        trajectories: torch.Tensor,
+        normalize_robustness: bool = True,
         timed: bool = True,
-        normalize: bool = True,
+        dt: float = 1.0,
+        kernel_type: str = 'gaussian',
+        sigma: float = 1.0,
         device: str = 'cpu',
+        cache_dir: str = None,
+        verbose: bool = True,
     ):
-        self.trajectory_sampler = trajectory_sampler
-        self.n_trajectories = n_trajectories
+        self.trajectories = trajectories.to(torch.device(device))
+        self.normalize_robustness = normalize_robustness
         self.timed = timed
-        self.normalize = normalize
+        self.dt = dt
+        self.kernel_type = kernel_type
+        self.sigma = sigma
         self.device = torch.device(device)
+
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        self.cache_dir = cache_dir
+        self.verbose = verbose
+     
     
-    def _to_device(
-        self,
-        tensor: torch.Tensor
-    ) -> torch.Tensor:
-        
-        return tensor.to(self.device) if tensor.device != self.device else tensor
-    
-    def compute_robustness_matrix(
+    def _compute_robustness(
         self,
         formulae: List,
-        trajectories: torch.Tensor,
-        verbose: bool = True,
     ) -> torch.Tensor:
         """
         Compute robustness matrix 
@@ -45,128 +52,189 @@ class STLKernel:
         Returns:
             R: Tensor of shape [n_formulae, n_trajectories, max_time_length]
         """
+
         n_formulae = len(formulae)
-        n_trajectories = trajectories.shape[0]
-        
-        # First pass: compute all robustness values and find max time length
         robustness_list = []
         max_time_length = 0
-
-        for formula in tqdm(formulae, disable=not verbose, desc="Computing robustness matrix"):
+        
+        for formula in tqdm(formulae, disable=not self.verbose, desc=f"Computing robustness matrix, timed: {self.timed}"):
             with torch.no_grad():
                 rho = formula.quantitative(
-                    trajectories, 
-                    evaluate_at_all_times=True,
-                    normalize=self.normalize,
+                    self.trajectories, 
+                    evaluate_at_all_times=self.timed,
+                    normalize=self.normalize_robustness,
                 )
-                
-            rho = self._to_device(rho).squeeze(1)  # [n_trajectories, time_steps]
-            robustness_list.append(rho)
-            max_time_length = max(max_time_length, rho.shape[1])
+
+            if self.timed: # rho = [n_trajectories, 1, n_timesteps] 
+                rho = rho.squeeze(1)  # -> [n_trajectories, n_timesteps]
+                robustness_list.append(rho)
+                max_time_length = max(max_time_length, rho.shape[1])
+            
+            else: # rho = [n_trajectories]
+                robustness_list.append(rho)
+
+        if self.timed: # Pad to uniform size and stack
+            n_trajectories = self.trajectories.shape[0]
+            R_pad = torch.zeros(n_formulae, n_trajectories, max_time_length, device=self.device)
+            
+            for i, rho in enumerate(robustness_list):
+                time_len = rho.shape[1]
+                R_pad[i, :, :time_len] = rho
+            
+            return R_pad
         
-        # Second pass: pad to uniform size and stack
-        R = torch.zeros(n_formulae, n_trajectories, max_time_length, device=self.device)
-        
-        for i, rho in enumerate(robustness_list):
-            time_len = rho.shape[1]
-            R[i, :, :time_len] = rho
-        
-        return R
-    
-    def compute_kernel_from_robustness(
-        self, 
-        R: torch.Tensor, 
-        kernel_type: str = 'gaussian',
-        sigma: float = 1.0,
-        verbose: bool = True,
-    ) -> torch.Tensor:
+        else:
+            R = torch.stack(robustness_list)
+            return R
+
+
+    def apply_gaussian(
+            self, 
+            K0: torch.Tensor, 
+            sigma: float
+        ) -> torch.Tensor:
         """
-        Compute kernel matrix from pre-computed robustness matrix.
+        Applies Gaussian transformation to a precomputed kernel matrix K0.
         
         Args:
-            R: Robustness matrix of shape [n_formulae, n_trajectories, time_length]
-            kernel_type: 'k_prime', 'k0', or 'gaussian'
-            sigma: Bandwidth for Gaussian kernel
-            verbose: Show progress
+            K0: Normalized kernel matrix
+            sigma: Bandwidth parameter
             
         Returns:
-            K: Kernel matrix of shape [n_formulae, n_formulae]
+            K_gauss: Gaussian kernel matrix
         """
-        n_formulae = R.shape[0]
-        n_trajectories = R.shape[1]
+        return torch.exp(-(2 - 2 * K0) / (sigma ** 2))
+    
+
+    def _compute_kernel(
+            self, 
+            R1: torch.Tensor,
+            R2: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+        """
+        Compute kernel matrix 
+            k[i, j] = integral_xi integral_t rho(phi_i, xi, t) rho(phi_j, xi, t) dt dmu0
         
-        # Compute k' (base kernel) matrix
+        Args:
+            R1: Robustness tensor of shape [n1_formulae, n_trajectories, n1_timesteps]
+                If only R1 is specified, the Gram matrix is computed.
+
+            R2: Optional robustness tensor of shape [n2_formulae, n_trajectories, n2_timesteps]
+                If R2 is specified, the Cross Kernel is computed.
+                        
+        Returns:
+            K: Tensor of shape [n1_formulae, n2_formulae]
+        """
+        
+        is_symmetric = R2 is None
+        if is_symmetric:
+            R2 = R1
+        
+        n_trajectories = R1.shape[1]
+
+        # Compute K_prime
         if self.timed:
-            # k'(φ_i, φ_j) = (1/n_trajectories) * Σ_samples Σ_time ρ_i * ρ_j * dt
-            # R[i]: [n_trajectories, time] -> expand to [n_trajectories, time, 1]
-            # R[j]: [n_trajectories, time] -> expand to [n_trajectories, 1, time]
-            # Product: [n_trajectories, time, time] but we only need diagonal
+            # R1 [n_formulae, n_trajectories, n1_timesteps]
+            # R2 [n_formulae, n_trajectories, n2_timesteps] 
+            # Pad to match R1 and R2 time dimensions for matrix multiplication
+            max_t = max(R1.shape[2], R2.shape[2])
+            R1_p = torch.nn.functional.pad(R1, (0, max_t - R1.shape[2]))
+            R2_p = torch.nn.functional.pad(R2, (0, max_t - R2.shape[2]))
             
-            # Simpler: for each pair (i,j), compute dot product over time and average over samples
-            K_prime = torch.zeros(n_formulae, n_formulae, device=self.device)
+            # Flatten to (n_formulae, n_trajectories * max_t)
+            X1 = R1_p.reshape(R1.shape[0], -1)
+            X2 = R2_p.reshape(R2.shape[0], -1)
             
-            for i in tqdm(range(n_formulae), disable=not verbose, desc="K' matrix"):
-                for j in range(i, n_formulae):
-                    # Find common time length
-                    # Get non-zero lengths for each formula
-                    len_i = (R[i].abs().sum(dim=0) > 0).sum().item()
-                    len_j = (R[j].abs().sum(dim=0) > 0).sum().item()
-                    common_len = min(len_i, len_j) if len_i > 0 and len_j > 0 else R.shape[2]
-                    
-                    # R[i, :, :common_len] * R[j, :, :common_len]: [n_trajectories, common_len]
-                    product = R[i, :, :common_len] * R[j, :, :common_len]
-                    # Sum over time, mean over samples
-                    k_val = product.sum(dim=1).mean().item()
-                    
-                    K_prime[i, j] = K_prime[j, i] = k_val
+            # K_prime[i,j] = (sum over time and trajectories) * dt / n_trajectories
+            K_prime = (X1 @ X2.T) / n_trajectories * self.dt
+        
+        else:  # untimed R [n_formulae, n_trajectories] 
+            K_prime = (R1 @ R2.T) / n_trajectories
+
+        if self.kernel_type == 'k_prime':
+            return K_prime
+
+        # Compute K0
+        if is_symmetric:
+            d1 = torch.diag(K_prime)
+            d2 = d1
         else:
-            # Untimed: only use t=0
-            # k'(φ_i, φ_j) = (1/n_trajectories) * Σ_samples ρ_i(t=0) * ρ_j(t=0)
-            R_t0 = R[:, :, 0]  # [n_formulae, n_trajectories]
-            # K'[i,j] = mean(R[i,:,0] * R[j,:,0])
-            K_prime = torch.mm(R_t0, R_t0.t()) / n_trajectories  # [n_formulae, n_formulae]
-        
-        if kernel_type == 'k_prime':
-            return K_prime.cpu()
-        
-        # Compute k0[i,j] = k'[i,j] / sqrt(k'[i,i] * k'[j,j])
-        diag = torch.diag(K_prime).clamp(min=1e-10)
-        normalizer = torch.sqrt(torch.outer(diag, diag))  # [n_formulae, n_formulae]
+            if self.timed:
+                d1 = (R1_p.reshape(R1.shape[0], -1)**2).sum(dim=1) / n_trajectories * self.dt
+                d2 = (R2_p.reshape(R2.shape[0], -1)**2).sum(dim=1) / n_trajectories * self.dt
+            else:
+                d1 = (R1**2).mean(dim=1)
+                d2 = (R2**2).mean(dim=1)
+
+        normalizer = torch.sqrt(torch.outer(d1, d2)).clamp(min=1e-10)
         K0 = K_prime / normalizer
         
-        if kernel_type == 'k0':
-            return K0.cpu()
+        if self.kernel_type == 'k0':
+            return K0
         
-        # Compute Gaussian kernel
-        # k[i,j] = exp(-(1 - 2*k0[i,j]) / σ²)
-        exponent = -(1 - 2 * K0) / (sigma ** 2)
-        exponent = torch.clamp(exponent, -500, 500)  # Prevent overflow
-        K_gauss = torch.exp(exponent)
+        # Compute K_gaussian
+        K_gauss = self.apply_gaussian(K0, self.sigma)
         
-        return K_gauss.cpu()
-    
-    def compute_kernel_matrix(
+        return K_gauss
+
+
+    def compute_kernel_train(
         self,
-        formulae: List,
-        kernel_type: str = 'gaussian',
-        sigma: float = 1.0,
-        verbose: bool = True
+        formulae_train: List,
     ) -> torch.Tensor:
         """
-        Compute kernel matrix efficiently by first computing robustness matrix.
+        Compute training kernel matrix.
         
         Args:
-            formulae: List of STL formulae
-            kernel_type: 'k_prime', 'k0', or 'gaussian'
-            sigma: Bandwidth for Gaussian kernel
-            verbose: Show progress
+            formulae_train: List of training formulae
             
         Returns:
-            K: Kernel matrix of shape [n_formulae, n_formulae]
+            Kernel matrix
         """
-
-        trajectories, time_points = self.trajectory_sampler(self.n_trajectories)
-        R = self.compute_robustness_matrix(formulae, trajectories, verbose=verbose)
-        K = self.compute_kernel_from_robustness(R, kernel_type, sigma, verbose=verbose)
         
-        return K
+        cache_path = os.path.join(self.cache_dir, "R_train.pt")
+        
+        if os.path.isfile(cache_path):
+            R_train = torch.load(cache_path, map_location=self.device)
+    
+        else:
+            R_train = self._compute_robustness(formulae_train)
+            torch.save(R_train, cache_path)
+
+        gram_matrix = self._compute_kernel(R_train)
+        return gram_matrix
+    
+    
+    def compute_kernel_cross(
+        self,
+        formulae_test: List,
+    ) -> torch.Tensor:
+        """
+        Compute cross kernel matrix between test and training formulae.
+        
+        Args:
+            formulae_test: List of test formulae
+            
+        Returns:
+            Cross kernel matrix
+        """
+        
+        file_R_train = os.path.join(self.cache_dir, "R_train.pt")
+        if os.path.isfile(file_R_train):
+            R_train = torch.load(file_R_train, map_location=self.device)
+        else:
+            raise FileNotFoundError(f"No training cache found at {self.cache_dir}. Compute kernel for train formulae first!")
+        
+        file_R_test = os.path.join(self.cache_dir, "R_test.pt")
+        if os.path.isfile(file_R_test):
+            R_test = torch.load(file_R_test, map_location=self.device)
+        else:
+            R_test = self._compute_robustness(formulae_test)
+            torch.save(R_test, file_R_test)
+        
+        cross_kernel = self._compute_kernel(R_test, R_train)
+        
+        return cross_kernel
+    
+    def remove_cache(self):
+        shutil.rmtree(self.cache_dir)
