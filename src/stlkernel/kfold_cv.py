@@ -28,7 +28,7 @@ def tune_stl_krr(
 
     print(f"Starting Grid Search on {len(sigmas)*len(alphas)} combinations...")
 
-    if len(formulae > 500):
+    if len(formulae):
         formulae=formulae[:500]
 
     for sigma, alpha in product(sigmas, alphas):
