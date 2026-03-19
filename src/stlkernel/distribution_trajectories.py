@@ -374,7 +374,152 @@ class FourierDistribution:
 
         return x, self.time_points
     
+
+class Mixture:
+    def __init__(
+        self,
+        a: float = 0.0,
+        b: float = 100.0,
+        delta: float = 1.0,
+        # Mu0 parameters
+        mu0_m_prime: float = 0.0,
+        mu0_sigma_prime: float = 1.0,
+        mu0_m_double_prime: float = 0.0,
+        mu0_sigma_double_prime: float = 1.0,
+        mu0_q: float = 0.1,
+        # Fourier parameters
+        fourier_n_harmonics: int = 5,
+        fourier_omega_mean: float = 0.1,
+        fourier_omega_std: float = 0.02,
+        fourier_a0_mean: float = 0.0,
+        fourier_a0_std: float = 0.5,
+        fourier_coef_std: float = 1.0,
+        # SDE (Ornstein-Uhlenbeck) parameters
+        ou_drift_coef: float = -0.1,
+        ou_diffusion_coef: float = 0.1,
+        ou_m_prime: float = 0.0,
+        ou_sigma_prime: float = 1.0,
+        # Common parameters
+        standardize: bool = True,
+        device: str = "cuda",
+    ):
+        """
+        Mixture distribution sampling 33% from Mu0, 33% from Fourier, 33% from Ornstein-Uhlenbeck SDE.
+        
+        Args:
+            a, b, delta: Time domain parameters
+            mu0_*: Parameters for Mu0 distribution
+            fourier_*: Parameters for Fourier distribution
+            ou_*: Parameters for Ornstein-Uhlenbeck SDE
+            standardize: Whether to standardize trajectories
+            device: Device to use ('cuda' or 'cpu')
+        """
+        self.a = a
+        self.b = b
+        self.delta = delta
+        self.standardize = standardize
+        self.device = device
+        
+        self.N = int((b - a) / delta)
+        self.time_points = torch.linspace(a, b, self.N + 1, device=device)
+        
+        # Initialize Mu0 distribution
+        self.mu0 = Mu0(
+            a=a,
+            b=b,
+            delta=delta,
+            m_prime=mu0_m_prime,
+            sigma_prime=mu0_sigma_prime,
+            m_double_prime=mu0_m_double_prime,
+            sigma_double_prime=mu0_sigma_double_prime,
+            q=mu0_q,
+            standardize=False,  # We'll standardize at the end
+            device=device,
+        )
+        
+        # Initialize Fourier distribution
+        self.fourier = FourierDistribution(
+            a=a,
+            b=b,
+            delta=delta,
+            n_harmonics=fourier_n_harmonics,
+            omega_mean=fourier_omega_mean,
+            omega_std=fourier_omega_std,
+            a0_mean=fourier_a0_mean,
+            a0_std=fourier_a0_std,
+            coef_std=fourier_coef_std,
+            standardize=False,  # We'll standardize at the end
+            device=device,
+        )
+        
+        # Initialize Ornstein-Uhlenbeck SDE
+        # drift(x, t) = -0.1 * x
+        # diffusion(x, t) = 0.1
+        def ou_drift(x, t):
+            return ou_drift_coef * x
+        
+        def ou_diffusion(x, t):
+            return ou_diffusion_coef * torch.ones_like(x)
+        
+        self.ou = SDE(
+            drift=ou_drift,
+            diffusion=ou_diffusion,
+            a=a,
+            b=b,
+            delta=delta,
+            m_prime=ou_m_prime,
+            sigma_prime=ou_sigma_prime,
+            standardize=False,  # We'll standardize at the end
+            device=device,
+        )
     
+    def sample(
+        self,
+        n_trajectories: int,
+        n_vars: int,
+        partition: str = 'train',
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample trajectories from mixture distribution.
+        
+        Args:
+            n_trajectories: Total number of trajectories to sample
+            n_vars: Dimension of each trajectory
+            partition: 'train' or 'test' (not used, for compatibility)
+            
+        Returns:
+            trajectories: [n_trajectories, n_vars, N+1]
+            time_points: [N+1]
+        """
+        device = self.device
+        
+        # Calculate how many samples from each distribution
+        # 33% each, handle remainder by giving extras to first distribution
+        n_mu0 = n_trajectories // 3
+        n_fourier = n_trajectories // 3
+        n_ou = n_trajectories - n_mu0 - n_fourier  # Gets remainder
+        
+        # Sample from each distribution
+        traj_mu0, _ = self.mu0.sample(n_mu0, n_vars, partition)
+        traj_fourier, _ = self.fourier.sample(n_fourier, n_vars, partition)
+        traj_ou, _ = self.ou.sample(n_ou, n_vars, partition)
+        
+        # Concatenate all trajectories
+        trajectories = torch.cat([traj_mu0, traj_fourier, traj_ou], dim=0)
+        
+        # Shuffle to mix the distributions
+        perm = torch.randperm(n_trajectories, device=device)
+        trajectories = trajectories[perm]
+        
+        # Apply standardization if requested
+        if self.standardize:
+            mean = torch.mean(trajectories, dim=(0, 2), keepdim=True)
+            std = torch.std(trajectories, dim=(0, 2), keepdim=True) + 1e-6
+            trajectories = (trajectories - mean) / std
+        
+        return trajectories, self.time_points
+
+
 class VAEDistribution:
     def __init__(
         self,

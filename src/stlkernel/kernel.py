@@ -21,7 +21,7 @@ class STLKernel:
         cache_dir: str = None,
         verbose: bool = True,
     ):
-        self.trajectories = trajectories.to(torch.device(device))
+        self.trajectories = trajectories.to(device)
         self.normalize_robustness = normalize_robustness
         self.timed = timed
         self.dt = dt
